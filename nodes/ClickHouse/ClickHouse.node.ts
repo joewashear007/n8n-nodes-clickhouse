@@ -9,6 +9,8 @@ import type {
 	INodeTypeDescription,
 } from 'n8n-workflow';
 
+import { NodeOperationError } from 'n8n-workflow';
+
 import { createClient, ClickHouseClientConfigOptions } from '@clickhouse/client'
 
 export class ClickHouse implements INodeType {
@@ -31,6 +33,15 @@ export class ClickHouse implements INodeType {
 				testedBy: 'clickhouseConnectionTest',
 			},
 		],
+		usableAsTool: {
+			replacements: {
+				codex: {
+					subcategories: {
+						Tools: ['Recommended Tools'],
+					},
+				},
+			},
+		},
 		properties: [
 			{
 				displayName: 'Operation',
@@ -69,7 +80,7 @@ export class ClickHouse implements INodeType {
 					'The SQL query to execute. You can use n8n expressions or ClickHouse query parameters.',
 			},
 			{
-				displayName: 'Table name',
+				displayName: 'Table Name',
 				name: 'table',
 				type: 'string',
 				displayOptions: {
@@ -83,40 +94,45 @@ export class ClickHouse implements INodeType {
 				description:
 					'The table name to insert data. You can use n8n expressions.',
 			},
-			// {
-			// 	displayName: 'Query parameters',
-			// 	name: 'queryParams',
-			// 	type: 'collection',
-			// 	placeholder: 'Add parameter',
-			// 	default: {},
-			// 	options: [
-			// 		{
-			// 			displayName: 'Name',
-			// 			name: 'name',
-			// 			type: 'string',
-			// 			displayOptions: {
-			// 				show: {
-			// 					operation: ['query', 'insert'],
-			// 				},
-			// 			},
-			// 			default: '',
-			// 			placeholder: 'SELECT id, name FROM product WHERE quantity > {quantity:Int32} AND price <= {price:Int32}',
-			// 			required: true,
-			// 		},
-			// 		{
-			// 			displayName: 'Value',
-			// 			name: 'value',
-			// 			type: 'string',
-			// 			displayOptions: {
-			// 				show: {
-			// 					operation: ['query', 'insert'],
-			// 				},
-			// 			},
-			// 			default: '',
-			// 			required: true,
-			// 		},
-			// 	],
-			// },
+			{
+				displayName: 'Options',
+				name: 'options',
+				type: 'collection',
+				placeholder: 'Add Option',
+				default: {},
+				displayOptions: {
+					show: {
+						operation: ['query'],
+					},
+				},
+				options: [
+					{
+						displayName: 'Schema Description',
+						name: 'schemaDescription',
+						type: 'string',
+						default: '',
+						placeholder: 'e.g., Available tables: users (ID, name, email), orders (ID, user_id, amount, date)',
+						description: 'Describe your database schema to help AI agents generate better queries',
+						typeOptions: {
+							rows: 3,
+						},
+					},
+					{
+						displayName: 'Read-Only Mode',
+						name: 'readOnlyMode',
+						type: 'boolean',
+						default: false,
+						description: 'Whether to allow only SELECT queries (recommended for AI tools to prevent accidental data modification)',
+					},
+					{
+						displayName: 'Max Results',
+						name: 'maxResults',
+						type: 'number',
+						default: 0,
+						description: 'Maximum number of rows to return (0 = no limit)',
+					},
+				],
+			},
 		],
 	};
 
@@ -135,7 +151,15 @@ export class ClickHouse implements INodeType {
 						password: credentials.password as string,
 					};
 
-					createClient(config);
+					const client = createClient(config);
+
+					// Actually test the connection by running a simple query
+					await client.query({
+						query: 'SELECT 1',
+						format: 'JSONEachRow',
+					});
+
+					await client.close();
 				} catch (error) {
 					return {
 						status: 'Error',
@@ -167,35 +191,61 @@ export class ClickHouse implements INodeType {
 
 		let returnItems: INodeExecutionData[] = [];
 
-		if (operation === 'query') {
-			const query = this.getNodeParameter('query', 0) as string;
+		try {
+			if (operation === 'query') {
+				let query = this.getNodeParameter('query', 0) as string;
+				const options = this.getNodeParameter('options', 0, {}) as IDataObject;
+				const readOnlyMode = options.readOnlyMode as boolean || false;
+				const maxResults = options.maxResults as number || 0;
 
-			const result = await client.query({
-				query: query,
-				format: 'JSONEachRow',
-				query_params: queryParams,
-			})
+				// Validate read-only mode
+				if (readOnlyMode) {
+					const normalizedQuery = query.trim().toUpperCase();
+					if (!normalizedQuery.startsWith('SELECT') &&
+						!normalizedQuery.startsWith('SHOW') &&
+						!normalizedQuery.startsWith('DESCRIBE') &&
+						!normalizedQuery.startsWith('DESC')) {
+						throw new NodeOperationError(
+							this.getNode(),
+							'Only SELECT, SHOW, and DESCRIBE queries are allowed in read-only mode',
+						);
+					}
+				}
 
+				// Add LIMIT if not present and maxResults is set
+				if (maxResults > 0 && !query.toUpperCase().includes('LIMIT')) {
+					query = `${query} LIMIT ${maxResults}`;
+				}
 
-			const rows = (await result.json()) as object[]
-			console.log('received CH rows', rows);
+				const result = await client.query({
+					query: query,
+					format: 'JSONEachRow',
+					query_params: queryParams,
+				});
 
-			returnItems = rows.map(row => ({json: row} as INodeExecutionData))
-		} else if (operation === 'insert') {
-			const items = this.getInputData().map(value => value.json);
-			const table = this.getNodeParameter('table', 0) as string;
+				const rows = (await result.json()) as object[];
+				console.log('received CH rows', rows);
 
-			console.log('insert CH rows', items);
+				returnItems = rows.map(row => ({json: row} as INodeExecutionData));
+			} else if (operation === 'insert') {
+				const items = this.getInputData().map(value => value.json);
+				const table = this.getNodeParameter('table', 0) as string;
 
-			await client.insert({
-				table: table,
-				format: 'JSONEachRow',
-				values: items,
-				query_params: queryParams,
-			})
+				console.log('insert CH rows', items);
+
+				await client.insert({
+					table: table,
+					format: 'JSONEachRow',
+					values: items,
+					query_params: queryParams,
+				});
+			}
+		} catch (error) {
+			await client.close();
+			throw error;
 		}
 
-		await client.close()
+		await client.close();
 
 		return this.prepareOutputData(returnItems);
 	}
