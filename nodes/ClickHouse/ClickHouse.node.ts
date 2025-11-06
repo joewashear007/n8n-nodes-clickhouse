@@ -107,17 +107,6 @@ export class ClickHouse implements INodeType {
 				},
 				options: [
 					{
-						displayName: 'Schema Description',
-						name: 'schemaDescription',
-						type: 'string',
-						default: '',
-						placeholder: 'e.g., Available tables: users (ID, name, email), orders (ID, user_id, amount, date)',
-						description: 'Describe your database schema to help AI agents generate better queries',
-						typeOptions: {
-							rows: 3,
-						},
-					},
-					{
 						displayName: 'Read-Only Mode',
 						name: 'readOnlyMode',
 						type: 'boolean',
